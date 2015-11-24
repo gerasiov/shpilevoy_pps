@@ -17,6 +17,11 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/rtc.h>
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
+#include <linux/spinlock.h>
+#include <linux/gfp.h>
+#include <linux/string.h>
 
 #include "ntp_internal.h"
 
@@ -117,6 +122,98 @@ static long pps_jitcnt;		/* jitter limit exceeded */
 static long pps_stbcnt;		/* stability limit exceeded */
 static long pps_errcnt;		/* calibration errors */
 
+#ifdef CONFIG_PPS_PROFILER
+
+/* Sets all global variables from values within profiler_vars_shot object */
+void set_vars_from_dump(profiler_vars_shot *shot) {
+	tick_usec = shot->shot_tick_usec;
+	tick_nsec = shot->shot_tick_nsec;
+	tick_length = shot->shot_tick_length;
+	tick_length_base = shot->shot_tick_length_base;
+	time_state = shot->shot_time_state;
+	time_status = shot->shot_time_status;
+	time_offset = shot->shot_time_offset;
+	time_constant = shot->shot_time_constant;
+	time_maxerror = shot->shot_time_maxerror;
+	time_esterror = shot->shot_time_esterror;
+	time_freq = shot->shot_time_freq;
+	time_reftime = shot->shot_time_reftime;
+	time_adjust = shot->shot_time_adjust;
+	ntp_tick_adj = shot->shot_ntp_tick_adj;
+	pps_valid = shot->shot_pps_valid;
+	memcpy(pps_tf, shot->shot_pps_tf, sizeof(long) * PPS_FILTER_SIZE);
+	pps_tf_pos = shot->shot_pps_tf_pos;
+	pps_jitter = shot->shot_pps_jitter;
+	pps_fbase = shot->shot_pps_fbase;
+	pps_shift = shot->shot_pps_shift;
+	pps_intcnt = shot->shot_pps_intcnt;
+	pps_freq = shot->shot_pps_freq;
+	pps_stabil = shot->shot_pps_stabil;
+	pps_calcnt = shot->shot_pps_calcnt;
+	pps_jitcnt = shot->shot_pps_jitcnt;
+	pps_stbcnt = shot->shot_pps_stbcnt;
+	pps_errcnt = shot->shot_pps_errcnt;
+}
+
+/* Sets values within profiler_vars_shot object from global variables */
+void get_vars_to_dump(profiler_vars_shot *dump);
+
+/* Monotinoc iterator for getting unic id for each log_entry */
+unsigned long profiler_iterator = 0;
+
+struct page *ring_pages = NULL;
+int ring_pages_order = 0;
+int ring_pages_cnt;
+
+struct page *ring_shot_pages = NULL;
+
+//#define PPS_PROFILER_DEBUG 1
+/* array of log records about hardpps working */
+profiler_log_entry *profiler_ring;
+/* spinlock for protecting main ring */
+spinlock_t profiler_ring_lock;
+
+/* last copy of profiler_ring for one pps_reader */
+profiler_log_entry *profiler_ring_shot;
+/* spinlock for protecting copy of ring */
+loff_t profiler_ring_copy_size;
+
+/* buffer, in which each action during one hardpps call is registered */
+profiler_log_entry cur_entry;
+
+/* parameters of main ring */
+loff_t profiler_ring_size = 0;
+loff_t profiler_ring_begin = 0;
+loff_t profiler_ring_end = 0;
+
+/* Array of dumps with all global variables */
+profiler_vars_shot dumps[DUMPS_CNT];
+int dumps_size = 0;
+
+/* 
+ * Dump that must be showed in log file before any timestamps,
+ * and that corresponds to first pair of timestamps.
+ */
+profiler_vars_shot shot_dump;
+
+/* entry for proc file */
+struct proc_dir_entry *ring_entry = NULL;
+
+/* constructor for profiler_ring */
+static void profiler_ring_init(void);
+
+/* constructor for profiler_log_entry */
+void clear_log_entry(profiler_log_entry *ob) {
+	ob->id = 0;
+}
+
+/* add timespec pair (real and raw) to entry */
+void add_pair_to_entry(profiler_log_entry *entry, const struct timespec *phase_ts, const struct timespec *raw_ts);
+
+/* add entry object to the end of main ring */
+void push_entry_to_ring(profiler_log_entry *entry);
+
+#endif
 
 /* PPS kernel consumer compensates the whole phase error immediately.
  * Otherwise, reduce the offset by a fixed factor times the time constant.
@@ -995,6 +1092,82 @@ static void hardpps_update_phase(long error)
 	pps_jitter += (jitter - pps_jitter) >> PPS_INTMIN;
 }
 
+#ifdef CONFIG_PPS_PROFILER
+
+static void profiler_ring_init(void) {
+	int one_size;
+	int all_size;
+	int pages_cnt;
+
+	profiler_ring_size = 0;
+	profiler_ring_end = 0;
+	profiler_ring_begin = 0;
+	profiler_iterator = 0;
+
+	if (ring_pages != NULL) {
+		__free_pages(ring_pages, ring_pages_order);
+		ring_pages = NULL;
+	}
+	if (ring_shot_pages != NULL) {
+		__free_pages(ring_shot_pages, ring_pages_order);
+		ring_shot_pages = NULL;
+	}
+	ring_pages_order = 0;
+	ring_pages_cnt = 1;
+	one_size = sizeof(profiler_log_entry);
+	all_size = one_size * PROFILER_RING_SIZE;
+	pages_cnt = all_size / PAGE_SIZE + 1;
+	while (ring_pages_cnt < pages_cnt) {
+		++ring_pages_order;
+		ring_pages_cnt = ring_pages_cnt << 1;
+	}
+	ring_pages = alloc_pages(GFP_DMA, ring_pages_order);
+	profiler_ring = page_address(ring_pages);
+	memset(profiler_ring, 0, PAGE_SIZE * ring_pages_cnt);
+
+	ring_shot_pages = alloc_pages(GFP_DMA, ring_pages_order);
+	profiler_ring_shot = page_address(ring_shot_pages);
+	memset(profiler_ring_shot, 0, PAGE_SIZE * ring_pages_order);
+	printk(KERN_ALERT "profiler_ring_init(): ring is inited\n");
+}
+
+void push_entry_to_ring(profiler_log_entry *entry) {
+#ifdef PROFILER_MAX_ITERS
+	if (profiler_iterator >= PROFILER_MAX_ITERS) return;
+#endif
+	entry->id = profiler_iterator;
+	if (profiler_ring_size < PROFILER_RING_SIZE) {
+		if (profiler_ring_size != 0) {
+			profiler_ring_end = ((int)profiler_ring_end + 1) % (int)PROFILER_RING_SIZE;
+			profiler_ring[profiler_ring_end] = *entry;
+			++profiler_ring_size;
+			if (profiler_ring_end == profiler_ring_begin) {
+				++profiler_ring_begin;
+				profiler_ring_size = PROFILER_RING_SIZE;
+			}
+		} else {
+			profiler_ring_init();
+			profiler_ring[0] = *entry;
+			profiler_ring_size = 1;
+		}
+	} else {
+		profiler_ring_begin = ((int)profiler_ring_begin + 1) % (int)PROFILER_RING_SIZE;
+		profiler_ring_end = ((int)profiler_ring_end + 1) % (int)PROFILER_RING_SIZE;
+		profiler_ring[profiler_ring_end] = *entry;
+	}
+	++profiler_iterator;
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "push_entry_to_ring(): size = %d, begin = %d, end = %d\n", (int)profiler_ring_size, (int)profiler_ring_begin, (int)profiler_ring_end);
+#endif
+}
+
+void add_pair_to_entry(profiler_log_entry *entry, const struct timespec *phase_ts, const struct timespec *raw_ts) {
+	entry->phase_ts = *phase_ts;
+	entry->raw_ts = *raw_ts;
+}
+
+#endif
+
 /*
  * __hardpps() - discipline CPU clock oscillator to external PPS signal
  *
@@ -1011,6 +1184,45 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 {
 	struct pps_normtime pts_norm, freq_norm;
 
+#ifdef CONFIG_PPS_PROFILER
+	int j, t;
+	spin_lock(&profiler_ring_lock);
+
+	t = (int)(profiler_ring_end + 1) % PROFILER_RING_SIZE;
+	if (t % ENTRIES_PER_DUMP == 0) {
+		j = t / ENTRIES_PER_DUMP;
+		dumps_size = (dumps_size + 1 >= DUMPS_CNT) ? dumps_size : (dumps_size + 1);
+		get_vars_to_dump(dumps + j);
+	} else if (!profiler_ring_size) {
+		get_vars_to_dump(dumps);
+	}
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "phase_ts: %llu, raw_ts: %llu\n", timespec_to_ns(phase_ts), timespec_to_ns(raw_ts));
+
+	printk(KERN_ALERT "tick_usec: %lu, tick_nsec: %lu, tick_length: %llu, tick_length_base: %llu\n", tick_usec, tick_nsec,
+		tick_length, tick_length_base);
+	printk(KERN_ALERT "time_state: %d, time_status: %d, time_offset: %lld, time_constant: %ld\n", time_state, time_status,
+		time_offset, time_constant);
+	printk(KERN_ALERT "time_maxerror: %ld, time_esterror: %ld, time_freq: %lld, time_reftime: %ld\n", time_maxerror,
+		time_esterror, time_freq, time_reftime);
+	printk(KERN_ALERT "time_adjust: %ld, ntp_tick_adj: %lld, pps_valid: %d, pps_tf: \n", time_adjust, ntp_tick_adj,
+		pps_valid);
+	for (j = 0; j < PPS_FILTER_SIZE; ++j) {
+		printk(KERN_ALERT "[%d]: %ld, ", j, pps_tf[j]);
+	}
+	printk(KERN_ALERT "pps_tf_pos: %u, pps_jitter: %ld, pps_fbase: %lld, pps_shift: %d\n", pps_tf_pos, pps_jitter,
+		timespec_to_ns(&pps_fbase), pps_shift);
+	printk(KERN_ALERT "pps_intcnt: %d, pps_freq: %lld, pps_stabil: %ld, pps_calcnt: %ld\n", pps_intcnt, pps_freq,
+		pps_stabil, pps_calcnt);
+	printk(KERN_ALERT "pps_jitcnt: %ld, pps_stbcnt: %ld, pps_errcnt: %ld\n", pps_jitcnt, pps_stbcnt, pps_errcnt);
+#endif
+	/* clear log entry for new log record creating */
+	clear_log_entry(&cur_entry);
+
+	/* add current timestamps to log entry */
+	add_pair_to_entry(&cur_entry, phase_ts, raw_ts);
+#endif
+
 	pts_norm = pps_normalize_ts(*phase_ts);
 
 	/* clean the error bits, they will be set again if needed */
@@ -1024,6 +1236,10 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	 * just start the frequency interval */
 	if (unlikely(pps_fbase.tv_sec == 0)) {
 		pps_fbase = *raw_ts;
+#ifdef CONFIG_PPS_PROFILER
+		push_entry_to_ring(&cur_entry);
+		spin_unlock(&profiler_ring_lock);
+#endif
 		return;
 	}
 
@@ -1037,7 +1253,11 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		/* restart the frequency calibration interval */
 		pps_fbase = *raw_ts;
 		pps_dec_freq_interval();
-		printk_deferred(KERN_ERR "hardpps: PPSJITTER: bad pulse\n");
+		pr_warning("hardpps: PPSJITTER: bad pulse, freq_norm={%ld,%ld}\n", freq_norm.sec, freq_norm.nsec);
+#ifdef CONFIG_PPS_PROFILER
+		push_entry_to_ring(&cur_entry);
+		spin_unlock(&profiler_ring_lock);
+#endif
 		return;
 	}
 
@@ -1052,7 +1272,10 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	}
 
 	hardpps_update_phase(pts_norm.nsec);
-
+#ifdef CONFIG_PPS_PROFILER
+	push_entry_to_ring(&cur_entry);
+	spin_unlock(&profiler_ring_lock);
+#endif
 }
 #endif	/* CONFIG_NTP_PPS */
 
@@ -1069,7 +1292,147 @@ static int __init ntp_tick_adj_setup(char *str)
 
 __setup("ntp_tick_adj=", ntp_tick_adj_setup);
 
+#ifdef CONFIG_PPS_PROFILER
+
+static void *pps_seq_start(struct seq_file *f, loff_t *pos) {
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "pps_seq_start(): pos = %d\n", (int)*pos);
+#endif
+	if (*pos >= profiler_ring_copy_size) return NULL;
+	return pos;
+}
+
+static void *pps_seq_next(struct seq_file *f, void *v, loff_t *pos) {
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "pps_seq_next(): pos = %d, size = %d\n", (int)*pos, (int)profiler_ring_copy_size);
+#endif
+	if (++(*pos) >= profiler_ring_copy_size) return NULL;
+	return pos;
+}
+
+static void pps_seq_stop(struct seq_file *f, void *v) {
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "pps_seq_stop():\n");
+#endif
+}
+
+static int pps_seq_show(struct seq_file *f, void *v) {
+	loff_t index;
+	profiler_log_entry *ob;
+	int i;
+
+	index = *(loff_t *)v;
+	ob = &(profiler_ring_shot[index]);
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "pps_seq_show(): index = %d\n", (int)index);
+#endif
+	if (index == 0) {
+		seq_printf(f, "%lu %lu %llu %llu %d %d %lld %ld %ld %ld %lld %ld %ld ", shot_dump.shot_tick_usec,
+			shot_dump.shot_tick_nsec, shot_dump.shot_tick_length, shot_dump.shot_tick_length_base,
+			shot_dump.shot_time_state, shot_dump.shot_time_status, shot_dump.shot_time_offset,
+			shot_dump.shot_time_constant, shot_dump.shot_time_maxerror, shot_dump.shot_time_esterror,
+			shot_dump.shot_time_freq, shot_dump.shot_time_reftime, shot_dump.shot_time_adjust);
+		seq_printf(f, "%lld %d ", shot_dump.shot_ntp_tick_adj, shot_dump.shot_pps_valid);
+		for (i = 0; i < PPS_FILTER_SIZE; ++i) {
+			seq_printf(f, "%ld ", shot_dump.shot_pps_tf[i]);
+		}
+		seq_printf(f, "%u %ld %lld %d %d %lld %ld %ld %ld %ld %ld\n", shot_dump.shot_pps_tf_pos,
+			shot_dump.shot_pps_jitter, timespec_to_ns(&(shot_dump.shot_pps_fbase)), shot_dump.shot_pps_shift,
+			shot_dump.shot_pps_intcnt, shot_dump.shot_pps_freq, shot_dump.shot_pps_stabil,
+			shot_dump.shot_pps_calcnt, shot_dump.shot_pps_jitcnt, shot_dump.shot_pps_stbcnt, shot_dump.shot_pps_errcnt);
+	}
+	seq_printf(f, "%lu # %llu %llu #\n", ob->id, timespec_to_ns(&(ob->phase_ts)), timespec_to_ns(&(ob->raw_ts)));
+	return 0;
+}
+
+static struct seq_operations pps_seq_ops = {
+	.start = pps_seq_start,
+	.next = pps_seq_next,
+	.stop = pps_seq_stop,
+	.show = pps_seq_show
+};
+
+void get_vars_to_dump(profiler_vars_shot *dump) {
+	dump->shot_tick_usec = tick_usec;
+	dump->shot_tick_nsec = tick_nsec;
+	dump->shot_tick_length = tick_length;
+	dump->shot_tick_length_base = tick_length_base;
+	dump->shot_time_state = time_state;
+	dump->shot_time_status = time_status;
+	dump->shot_time_offset = time_offset;
+	dump->shot_time_constant = time_constant;
+	dump->shot_time_maxerror = time_maxerror;
+	dump->shot_time_esterror = time_esterror;
+	dump->shot_time_freq = time_freq;
+	dump->shot_time_reftime = time_reftime;
+	dump->shot_time_adjust = time_adjust;
+	dump->shot_ntp_tick_adj = ntp_tick_adj;
+	dump->shot_pps_valid = pps_valid;
+	dump->shot_pps_tf_pos = pps_tf_pos;
+	dump->shot_pps_jitter = pps_jitter;
+	dump->shot_pps_fbase = pps_fbase;
+	dump->shot_pps_shift = pps_shift;
+	dump->shot_pps_intcnt = pps_intcnt;
+	dump->shot_pps_freq = pps_freq;
+	dump->shot_pps_stabil = pps_stabil;
+	dump->shot_pps_calcnt = pps_calcnt;
+	dump->shot_pps_jitcnt = pps_jitcnt;
+	dump->shot_pps_stbcnt = pps_stbcnt;
+	dump->shot_pps_errcnt = pps_errcnt;
+	memcpy(dump->shot_pps_tf, pps_tf, PPS_FILTER_SIZE * sizeof(long));
+} 
+
+static int pps_profiler_open(struct inode *inode, struct file *file) {
+	int i;
+	int j;
+	int start;
+#ifdef PPS_PROFILER_DEBUG
+	printk(KERN_ALERT "pps_profiler_open():\n");
+#endif
+	spin_lock(&profiler_ring_lock);
+
+	start = profiler_ring_begin;
+	for (i = profiler_ring_begin; i != profiler_ring_end; i = (i + 1) % PROFILER_RING_SIZE) {
+		if (i % ENTRIES_PER_DUMP == 0) {
+			start = i;
+			shot_dump = dumps[i / ENTRIES_PER_DUMP];
+			break;
+		}
+	}
+	for (i = start, j = 0; i != profiler_ring_end; i = (i + 1) % PROFILER_RING_SIZE) {
+		profiler_ring_shot[j++] = profiler_ring[i];
+	}
+	if (i == profiler_ring_end) {
+		profiler_ring_shot[j] = profiler_ring[i];
+	}
+	profiler_ring_copy_size = j + 1;
+	printk(KERN_ALERT "profiler_ring_copy_size: %d\n", (int)profiler_ring_copy_size);
+
+	spin_unlock(&profiler_ring_lock);
+
+	return seq_open(file, &pps_seq_ops);
+}
+
+static struct file_operations pps_proc_ops = {
+	.owner = THIS_MODULE,
+	.open = pps_profiler_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = seq_release
+};
+
+EXPORT_SYMBOL(set_vars_from_dump);
+#endif
+
 void __init ntp_init(void)
 {
+#ifdef CONFIG_PPS_PROFILER
+	printk(KERN_ALERT "ntp_init():\n");
+	/* create proc file pps_profiler */
+	ring_entry = proc_create("pps_profiler", 0, NULL, &pps_proc_ops);
+	printk(KERN_ALERT "pps_profiler file was created\n");
+	profiler_ring_init();
+#endif
+
 	ntp_clear();
 }

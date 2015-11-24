@@ -1,6 +1,8 @@
 #ifndef _LINUX_NTP_INTERNAL_H
 #define _LINUX_NTP_INTERNAL_H
 
+#include "linux/pps-profiler-utils.h"
+
 extern void ntp_init(void);
 extern void ntp_clear(void);
 /* Returns how long ticks are at present, in ns / 2^NTP_SCALE_SHIFT. */

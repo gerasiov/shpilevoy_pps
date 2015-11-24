@@ -4,6 +4,9 @@
 
 menu "PPS support"
 
+config PPS_PROFILER
+	bool "PPS Profiler for debuging"
+
 config PPS
 	tristate "PPS support"
 	---help---
