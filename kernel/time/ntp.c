@@ -122,6 +122,14 @@ static long pps_jitcnt;		/* jitter limit exceeded */
 static long pps_stbcnt;		/* stability limit exceeded */
 static long pps_errcnt;		/* calibration errors */
 
+PPSKalman kalman_filter;
+char kalman_is_inited = 0;
+
+#ifdef CONFIG_PPS_DEBUG
+//previous timestamps from __hardpps
+struct timespec phase_ts_prev, raw_ts_prev;
+#endif
+
 #ifdef CONFIG_PPS_PROFILER
 
 /* Sets all global variables from values within profiler_vars_shot object */
@@ -1182,10 +1190,42 @@ void add_pair_to_entry(profiler_log_entry *entry, const struct timespec *phase_t
  */
 void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_ts)
 {
+	static const char *__func_name = "__hardpps";
 	struct pps_normtime pts_norm, freq_norm;
+	long jitter;
+	struct timespec raw_time = *raw_ts;
+	struct timespec real_time = *phase_ts;
+	int j, t;
+
+	if (!kalman_is_inited) {
+		PPSKalman_init(&kalman_filter, timespec_to_ns(raw_ts), timespec_to_ns(phase_ts),
+			((s64)1) << NTP_SCALE_SHIFT - 2, ((s64)1) << NTP_SCALE_SHIFT - 2, //current probe estimate is 1
+			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2) * 5, 10000), //q11 = 0.0005
+			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2) * 5, 10000), //q22 = 0.0005
+			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2), 10),  //r11 = 0.1
+			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2), 10)); //r22 = 0.1
+		kalman_is_inited = 1;
+	} else {
+		PPSKalman_Step(&kalman_filter, NSEC_PER_SEC,
+			NSEC_PER_SEC, timespec_to_ns(raw_ts),
+			timespec_to_ns(phase_ts));
+#ifdef CONFIG_PPS_DEBUG
+		printk(KERN_DEBUG "kalman raw: %lld, kalman real: %lld\n", kalman_filter.cse11, kalman_filter.cse21);
+		printk(KERN_DEBUG "kraw - original: %lld, kreal - original: %lld\n", kalman_filter.cse11 - timespec_to_ns(raw_ts),
+			kalman_filter.cse21 - timespec_to_ns(phase_ts));
+		printk(KERN_DEBUG "nsecs from last: real = %lld, raw = %lld\n",
+			timespec_to_ns(phase_ts) - timespec_to_ns(&phase_ts_prev),
+			timespec_to_ns(raw_ts) - timespec_to_ns(&raw_ts_prev));
+#endif
+		raw_time = ns_to_timespec(kalman_filter.cse11);
+		real_time = ns_to_timespec(kalman_filter.cse21);
+	}
+#ifdef CONFIG_PPS_DEBUG
+	phase_ts_prev = *phase_ts;
+	raw_ts_prev = *raw_ts;
+#endif
 
 #ifdef CONFIG_PPS_PROFILER
-	int j, t;
 	spin_lock(&profiler_ring_lock);
 
 	t = (int)(profiler_ring_end + 1) % PROFILER_RING_SIZE;
@@ -1198,7 +1238,6 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	}
 #ifdef PPS_PROFILER_DEBUG
 	printk(KERN_ALERT "phase_ts: %llu, raw_ts: %llu\n", timespec_to_ns(phase_ts), timespec_to_ns(raw_ts));
-
 	printk(KERN_ALERT "tick_usec: %lu, tick_nsec: %lu, tick_length: %llu, tick_length_base: %llu\n", tick_usec, tick_nsec,
 		tick_length, tick_length_base);
 	printk(KERN_ALERT "time_state: %d, time_status: %d, time_offset: %lld, time_constant: %ld\n", time_state, time_status,
@@ -1216,6 +1255,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		pps_stabil, pps_calcnt);
 	printk(KERN_ALERT "pps_jitcnt: %ld, pps_stbcnt: %ld, pps_errcnt: %ld\n", pps_jitcnt, pps_stbcnt, pps_errcnt);
 #endif
+	pr_warning("%s: correction = %ld\n", __func_name, pps_phase_filter_smart(&jitter));
 	/* clear log entry for new log record creating */
 	clear_log_entry(&cur_entry);
 
@@ -1223,7 +1263,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	add_pair_to_entry(&cur_entry, phase_ts, raw_ts);
 #endif
 
-	pts_norm = pps_normalize_ts(*phase_ts);
+	pts_norm = pps_normalize_ts(real_time);
 
 	/* clean the error bits, they will be set again if needed */
 	time_status &= ~(STA_PPSJITTER | STA_PPSWANDER | STA_PPSERROR);
@@ -1235,7 +1275,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	/* when called for the first time,
 	 * just start the frequency interval */
 	if (unlikely(pps_fbase.tv_sec == 0)) {
-		pps_fbase = *raw_ts;
+		pps_fbase = raw_time;
 #ifdef CONFIG_PPS_PROFILER
 		push_entry_to_ring(&cur_entry);
 		spin_unlock(&profiler_ring_lock);
@@ -1244,14 +1284,16 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	}
 
 	/* ok, now we have a base for frequency calculation */
-	freq_norm = pps_normalize_ts(timespec64_sub(*raw_ts, pps_fbase));
-
+	freq_norm = pps_normalize_ts(timespec_sub(raw_time, pps_fbase));
+#ifdef PPS_DEBUG
+	pr_warning("pts_norm={%ld,%ld} raw_time.nsec=%ld freq_norm={%ld,%ld}\n", pts_norm.sec, pts_norm.nsec, raw_time.tv_nsec, freq_norm.sec, freq_norm.nsec);
+#endif
 	/* check that the signal is in the range
 	 * [1s - MAXFREQ us, 1s + MAXFREQ us], otherwise reject it */
 	if (abs(freq_norm.nsec) > MAXFREQ * freq_norm.sec) {
 		time_status |= STA_PPSJITTER;
 		/* restart the frequency calibration interval */
-		pps_fbase = *raw_ts;
+		pps_fbase = raw_time;
 		pps_dec_freq_interval();
 		pr_warning("hardpps: PPSJITTER: bad pulse, freq_norm={%ld,%ld}\n", freq_norm.sec, freq_norm.nsec);
 #ifdef CONFIG_PPS_PROFILER
@@ -1267,7 +1309,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	if (freq_norm.sec >= (1 << pps_shift)) {
 		pps_calcnt++;
 		/* restart the frequency calibration interval */
-		pps_fbase = *raw_ts;
+		pps_fbase = raw_time;
 		hardpps_update_freq(freq_norm);
 	}
 
@@ -1435,4 +1477,57 @@ void __init ntp_init(void)
 #endif
 
 	ntp_clear();
+}
+
+// Kalman filter implementation
+
+void PPSKalman_init(PPSKalman *ob, s64 cse11, s64 cse21,
+	s64 cpe11, s64 cpe22, s64 q11, s64 q22, s64 r11, s64 r22)
+{
+	ob->cse11 = cse11;
+	ob->cse21 = cse21;
+	ob->cpe11 = cpe11;
+	ob->cpe22 = cpe22;
+	ob->q11 = q11;
+	ob->q22 = q22;
+	ob->r11 = r11;
+	ob->r22 = r22;
+}
+
+s64 kalman_step_update_cse_impl(s64 cse, s64 cv, s64 m, s64 cpe, s64 q, s64 r)
+{
+	s64 tmp1, tmp2, tmp3, right;
+	char sign;
+	u32 l, h;
+	tmp1 = cse + cv;
+	tmp3 = m - cse - cv;
+	tmp2 = div_s64(((cpe << NTP_SCALE_SHIFT) + (q << NTP_SCALE_SHIFT)),
+		(cpe + q + r));
+	if (((tmp2 > 0) && (tmp3 > 0)) || ((tmp2 < 0) && (tmp3 < 0))) sign = 1;
+	else sign = -1;
+	if (tmp2 < 0) tmp2 *= -1;
+	if (tmp3 < 0) tmp3 *= -1;
+	l = tmp3 & 0xffffffff;
+	h = (tmp3 >> NTP_SCALE_SHIFT) & 0xffffffff;
+	right = tmp2 * h + (((tmp2 * l) >> NTP_SCALE_SHIFT) & 0xffffffff);
+	right *= sign;
+	return right + tmp1;
+}
+
+inline s64 kalman_step_update_cpe_impl(s64 r, s64 cpe, s64 q)
+{
+	return (r * ((((s64)1) << NTP_SCALE_SHIFT) -
+		div_s64((r * (((s64)1) << NTP_SCALE_SHIFT)),
+		(cpe + q + r)))) >> NTP_SCALE_SHIFT;
+}
+
+void PPSKalman_Step(PPSKalman *ob, s64 cv11, s64 cv21, s64 m11, s64 m21)
+{
+	ob->cse11 = kalman_step_update_cse_impl(ob->cse11, cv11,
+		m11, ob->cpe11, ob->q11, ob->r11);
+	ob->cse21 = kalman_step_update_cse_impl(ob->cse21, cv21,
+		m21, ob->cpe22, ob->q22, ob->r22);
+
+	ob->cpe11 = kalman_step_update_cpe_impl(ob->r11, ob->cpe11, ob->q11);
+	ob->cpe22 = kalman_step_update_cpe_impl(ob->r22, ob->cpe22, ob->q22);
 }
