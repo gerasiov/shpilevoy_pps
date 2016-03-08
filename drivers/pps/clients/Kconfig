@@ -6,6 +6,9 @@ if PPS
 
 comment "PPS clients support"
 
+config PPS_CLIENT_PLAYER
+	tristate "Player for pps_profiler logs"
+
 config PPS_CLIENT_KTIMER
 	tristate "Kernel timer client (Testing client, use for debug)"
 	help
