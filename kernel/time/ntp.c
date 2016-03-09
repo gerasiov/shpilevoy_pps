@@ -1199,11 +1199,11 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 
 	if (!kalman_is_inited) {
 		PPSKalman_init(&kalman_filter, timespec_to_ns(raw_ts), timespec_to_ns(phase_ts),
-			((s64)1) << NTP_SCALE_SHIFT - 2, ((s64)1) << NTP_SCALE_SHIFT - 2, //current probe estimate is 1
-			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2) * 5, 10000), //q11 = 0.0005
-			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2) * 5, 10000), //q22 = 0.0005
-			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2), 10),  //r11 = 0.1
-			div_s64((((s64)1) << NTP_SCALE_SHIFT - 2), 10)); //r22 = 0.1
+			((s64)1) << (NTP_SCALE_SHIFT - 2), ((s64)1) << (NTP_SCALE_SHIFT - 2), //current probe estimate is 1
+			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)) * 25, 1000), //q11 = 0.025
+			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)) * 25, 1000), //q22 = 0.025
+			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)), 10),  //r11 = 0.1
+			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)), 10)); //r22 = 0.1
 		kalman_is_inited = 1;
 	} else {
 		PPSKalman_Step(&kalman_filter, NSEC_PER_SEC,
