@@ -216,7 +216,8 @@ void clear_log_entry(profiler_log_entry *ob) {
 }
 
 /* add timespec pair (real and raw) to entry */
-void add_pair_to_entry(profiler_log_entry *entry, const struct timespec *phase_ts, const struct timespec *raw_ts);
+void add_pair_to_entry(profiler_log_entry *entry,
+	const struct timespec64 *phase_ts, const struct timespec64 *raw_ts);
 
 /* add entry object to the end of main ring */
 void push_entry_to_ring(profiler_log_entry *entry);
@@ -1169,7 +1170,8 @@ void push_entry_to_ring(profiler_log_entry *entry) {
 #endif
 }
 
-void add_pair_to_entry(profiler_log_entry *entry, const struct timespec *phase_ts, const struct timespec *raw_ts) {
+void add_pair_to_entry(profiler_log_entry *entry,
+	const struct timespec64 *phase_ts, const struct timespec64 *raw_ts) {
 	entry->phase_ts = *phase_ts;
 	entry->raw_ts = *raw_ts;
 }
@@ -1193,12 +1195,12 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	static const char *__func_name = "__hardpps";
 	struct pps_normtime pts_norm, freq_norm;
 	long jitter;
-	struct timespec raw_time = *raw_ts;
-	struct timespec real_time = *phase_ts;
+	struct timespec64 raw_time = *raw_ts;
+	struct timespec64 real_time = *phase_ts;
 	int j, t;
 
 	if (!kalman_is_inited) {
-		PPSKalman_init(&kalman_filter, timespec_to_ns(raw_ts), timespec_to_ns(phase_ts),
+		PPSKalman_init(&kalman_filter, timespec64_to_ns(raw_ts), timespec64_to_ns(phase_ts),
 			((s64)1) << (NTP_SCALE_SHIFT - 2), ((s64)1) << (NTP_SCALE_SHIFT - 2), //current probe estimate is 1
 			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)) * 25, 1000), //q11 = 0.025
 			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)) * 25, 1000), //q22 = 0.025
@@ -1207,18 +1209,18 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		kalman_is_inited = 1;
 	} else {
 		PPSKalman_Step(&kalman_filter, NSEC_PER_SEC,
-			NSEC_PER_SEC, timespec_to_ns(raw_ts),
-			timespec_to_ns(phase_ts));
+			NSEC_PER_SEC, timespec64_to_ns(raw_ts),
+			timespec64_to_ns(phase_ts));
 #ifdef CONFIG_PPS_DEBUG
 		printk(KERN_DEBUG "kalman raw: %lld, kalman real: %lld\n", kalman_filter.cse11, kalman_filter.cse21);
-		printk(KERN_DEBUG "kraw - original: %lld, kreal - original: %lld\n", kalman_filter.cse11 - timespec_to_ns(raw_ts),
-			kalman_filter.cse21 - timespec_to_ns(phase_ts));
+		printk(KERN_DEBUG "kraw - original: %lld, kreal - original: %lld\n", kalman_filter.cse11 - timespec64_to_ns(raw_ts),
+			kalman_filter.cse21 - timespec64_to_ns(phase_ts));
 		printk(KERN_DEBUG "nsecs from last: real = %lld, raw = %lld\n",
-			timespec_to_ns(phase_ts) - timespec_to_ns(&phase_ts_prev),
-			timespec_to_ns(raw_ts) - timespec_to_ns(&raw_ts_prev));
+			timespec64_to_ns(phase_ts) - timespec64_to_ns(&phase_ts_prev),
+			timespec64_to_ns(raw_ts) - timespec64_to_ns(&raw_ts_prev));
 #endif
-		raw_time = ns_to_timespec(kalman_filter.cse11);
-		real_time = ns_to_timespec(kalman_filter.cse21);
+		raw_time = ns_to_timespec64(kalman_filter.cse11);
+		real_time = ns_to_timespec64(kalman_filter.cse21);
 	}
 #ifdef CONFIG_PPS_DEBUG
 	phase_ts_prev = *phase_ts;
@@ -1237,7 +1239,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		get_vars_to_dump(dumps);
 	}
 #ifdef PPS_PROFILER_DEBUG
-	printk(KERN_ALERT "phase_ts: %llu, raw_ts: %llu\n", timespec_to_ns(phase_ts), timespec_to_ns(raw_ts));
+	printk(KERN_ALERT "phase_ts: %llu, raw_ts: %llu\n", timespec64_to_ns(phase_ts), timespec64_to_ns(raw_ts));
 	printk(KERN_ALERT "tick_usec: %lu, tick_nsec: %lu, tick_length: %llu, tick_length_base: %llu\n", tick_usec, tick_nsec,
 		tick_length, tick_length_base);
 	printk(KERN_ALERT "time_state: %d, time_status: %d, time_offset: %lld, time_constant: %ld\n", time_state, time_status,
@@ -1250,7 +1252,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		printk(KERN_ALERT "[%d]: %ld, ", j, pps_tf[j]);
 	}
 	printk(KERN_ALERT "pps_tf_pos: %u, pps_jitter: %ld, pps_fbase: %lld, pps_shift: %d\n", pps_tf_pos, pps_jitter,
-		timespec_to_ns(&pps_fbase), pps_shift);
+		timespec64_to_ns(&pps_fbase), pps_shift);
 	printk(KERN_ALERT "pps_intcnt: %d, pps_freq: %lld, pps_stabil: %ld, pps_calcnt: %ld\n", pps_intcnt, pps_freq,
 		pps_stabil, pps_calcnt);
 	printk(KERN_ALERT "pps_jitcnt: %ld, pps_stbcnt: %ld, pps_errcnt: %ld\n", pps_jitcnt, pps_stbcnt, pps_errcnt);
@@ -1284,7 +1286,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	}
 
 	/* ok, now we have a base for frequency calculation */
-	freq_norm = pps_normalize_ts(timespec_sub(raw_time, pps_fbase));
+	freq_norm = pps_normalize_ts(timespec64_sub(raw_time, pps_fbase));
 #ifdef PPS_DEBUG
 	pr_warning("pts_norm={%ld,%ld} raw_time.nsec=%ld freq_norm={%ld,%ld}\n", pts_norm.sec, pts_norm.nsec, raw_time.tv_nsec, freq_norm.sec, freq_norm.nsec);
 #endif
@@ -1295,7 +1297,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		/* restart the frequency calibration interval */
 		pps_fbase = raw_time;
 		pps_dec_freq_interval();
-		pr_warning("hardpps: PPSJITTER: bad pulse, freq_norm={%ld,%ld}\n", freq_norm.sec, freq_norm.nsec);
+		pr_warning("hardpps: PPSJITTER: bad pulse, freq_norm={%lld,%ld}\n", freq_norm.sec, freq_norm.nsec);
 #ifdef CONFIG_PPS_PROFILER
 		push_entry_to_ring(&cur_entry);
 		spin_unlock(&profiler_ring_lock);
@@ -1379,11 +1381,11 @@ static int pps_seq_show(struct seq_file *f, void *v) {
 			seq_printf(f, "%ld ", shot_dump.shot_pps_tf[i]);
 		}
 		seq_printf(f, "%u %ld %lld %d %d %lld %ld %ld %ld %ld %ld\n", shot_dump.shot_pps_tf_pos,
-			shot_dump.shot_pps_jitter, timespec_to_ns(&(shot_dump.shot_pps_fbase)), shot_dump.shot_pps_shift,
+			shot_dump.shot_pps_jitter, timespec64_to_ns(&(shot_dump.shot_pps_fbase)), shot_dump.shot_pps_shift,
 			shot_dump.shot_pps_intcnt, shot_dump.shot_pps_freq, shot_dump.shot_pps_stabil,
 			shot_dump.shot_pps_calcnt, shot_dump.shot_pps_jitcnt, shot_dump.shot_pps_stbcnt, shot_dump.shot_pps_errcnt);
 	}
-	seq_printf(f, "%lu # %llu %llu #\n", ob->id, timespec_to_ns(&(ob->phase_ts)), timespec_to_ns(&(ob->raw_ts)));
+	seq_printf(f, "%lu # %llu %llu #\n", ob->id, timespec64_to_ns(&(ob->phase_ts)), timespec64_to_ns(&(ob->raw_ts)));
 	return 0;
 }
 

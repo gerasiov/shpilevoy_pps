@@ -66,14 +66,14 @@ static void pps_ktimer_event(unsigned long ptr)
 #endif
 
 	if (ring_is_played) {
-		ts.ts_raw = ns_to_timespec(0);
-		ts.ts_real = ns_to_timespec(0);
+		ts.ts_raw = ns_to_timespec64(0);
+		ts.ts_real = ns_to_timespec64(0);
 	} else {
 		if (ring_iter >= PROFILER_RING_SIZE) {
 			printk(KERN_ALERT "Playing ring stoped\n");
 			ring_is_played = 1;
-			ts.ts_raw = ns_to_timespec(0);
-			ts.ts_real = ns_to_timespec(0);
+			ts.ts_raw = ns_to_timespec64(0);
+			ts.ts_real = ns_to_timespec64(0);
 		} else {
 			cur = player_ring + ring_iter++;
 			ts.ts_raw = cur->raw_ts;
@@ -150,8 +150,8 @@ int profiler_log_entry_from_string(profiler_log_entry *ob, const char *str, size
 		printk(KERN_ALERT "Incorrect second ts\n");
 		return -1;
 	}
-	ob->phase_ts = ns_to_timespec(first_ts);
-	ob->raw_ts = ns_to_timespec(second_ts);
+	ob->phase_ts = ns_to_timespec64(first_ts);
+	ob->raw_ts = ns_to_timespec64(second_ts);
 	ob->id = id;
 	move_cursor_while_not(&cursor, size, str, '#');
 	if ((cursor >= size) || (str[cursor] != '#')) {
@@ -263,7 +263,7 @@ ssize_t pps_player_write(struct file *filp, const char *buf, size_t count, loff_
 			}
 			__set_field_with_func(pps_tf_pos, ul);
 			__set_field_with_func(pps_jitter, l);
-			vars_shot.shot_pps_fbase = ns_to_timespec(simple_strtoll(buffer + rc, NULL, 0));
+			vars_shot.shot_pps_fbase = ns_to_timespec64(simple_strtoll(buffer + rc, NULL, 0));
 			move_cursor_while_not(&rc, buffer_it, buffer, ' ');
 			++rc;
 			__set_field_with_func(pps_shift, l);
