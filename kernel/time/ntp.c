@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/gfp.h>
 #include <linux/string.h>
+#include <linux/init.h>
 
 #include "ntp_internal.h"
 
@@ -124,10 +125,13 @@ static long pps_errcnt;		/* calibration errors */
 
 PPSKalman kalman_filter;
 char kalman_is_inited = 0;
+s64 kalman_q_core_param = 0;
+s64 kalman_start_offset_core_param = 0;
+long (*pps_phase_filter_ptr)(long *) = NULL;
 
 #ifdef CONFIG_PPS_DEBUG
 //previous timestamps from __hardpps
-struct timespec phase_ts_prev, raw_ts_prev;
+struct timespec64 phase_ts_prev, raw_ts_prev;
 #endif
 
 #ifdef CONFIG_PPS_PROFILER
@@ -162,6 +166,45 @@ void set_vars_from_dump(profiler_vars_shot *shot) {
 	pps_stbcnt = shot->shot_pps_stbcnt;
 	pps_errcnt = shot->shot_pps_errcnt;
 }
+
+/* Parse kernel boot parameters */
+static int __init setup_kernel_param_kalman_q(char *str) {
+	char *iter;
+	s64 res;
+	s64 delimiter;
+
+	printk(KERN_ALERT "Kernel param for Kalman: %s\n", str);
+	res = 0;
+	iter = str;
+	delimiter = -1;
+	while(iter && (*iter)) {
+		if (*iter != '.') {
+			res = res * 10 + (*iter) - '0';
+		} else {
+			delimiter = 1;
+			++iter;
+			continue;
+		}
+		if (delimiter > 0) {
+			delimiter *= 10;
+		}
+		++iter;
+	}
+	printk(KERN_ALERT "Kernel param q: %lld / %lld\n", res, delimiter);
+	if (delimiter < 0) delimiter = 1;
+	kalman_q_core_param = div_s64((res << (NTP_SCALE_SHIFT - 2)), delimiter);
+	return 0;
+}
+
+/* Parse kernel boot parameters */
+static int __init setup_kernel_param_kalman_start(char *str) {
+	printk(KERN_ALERT "Kernel param for Kalman: %s\n", str);
+	kalman_start_offset_core_param = simple_strtoll(str, NULL, 0);
+	return 0;
+}
+
+early_param("kalman_q", setup_kernel_param_kalman_q);
+early_param("kalman_start_offset", setup_kernel_param_kalman_start);
 
 /* Sets values within profiler_vars_shot object from global variables */
 void get_vars_to_dump(profiler_vars_shot *dump);
@@ -985,6 +1028,24 @@ static inline long pps_phase_filter_smart(long *jitter)
 	return res;
 }
 
+static int __init setup_kernel_param_kalman_filter_algo(char *str) {
+	if (!strcmp(str, "smart")) {
+		pps_phase_filter_ptr = pps_phase_filter_smart;
+	} else if (!strcmp(str, "last")) {
+		pps_phase_filter_ptr = pps_phase_filter_get;
+	}
+	return 0;
+}
+
+early_param("kalman_filter_algo", setup_kernel_param_kalman_filter_algo);
+
+static inline long pps_phase_filter_impl(long *jitter)
+{
+	if (pps_phase_filter_ptr) {
+		return pps_phase_filter_ptr(jitter);
+	} else return pps_phase_filter_smart(jitter);
+}
+
 /* decrease (half) frequency calibration interval length.
  */
 static inline void pps_dec_freq_interval(void)
@@ -1078,7 +1139,7 @@ static void hardpps_update_phase(long error)
 
 	/* add the sample to the median filter */
 	pps_phase_filter_add(correction);
-	correction = pps_phase_filter_smart(&jitter);
+	correction = pps_phase_filter_impl(&jitter);
 
 	/* Nominal jitter is due to PPS signal noise. If it exceeds the
 	 * threshold, the sample is discarded; otherwise, if so enabled,
@@ -1198,15 +1259,23 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	struct timespec64 raw_time = *raw_ts;
 	struct timespec64 real_time = *phase_ts;
 	int j, t;
+	long phase_filer_res = pps_phase_filter_impl(&jitter);
+#ifdef CONFIG_PPS_DEBUG
+	printk(KERN_DEBUG "phase_filer_res: %ld\n", phase_filer_res);
+#endif
 
-	if (!kalman_is_inited) {
+	if (!kalman_is_inited && ((kalman_start_offset_core_param <= 0) ||
+		(kalman_start_offset_core_param >= abs(phase_filer_res)))) {
 		PPSKalman_init(&kalman_filter, timespec64_to_ns(raw_ts), timespec64_to_ns(phase_ts),
 			((s64)1) << (NTP_SCALE_SHIFT - 2), ((s64)1) << (NTP_SCALE_SHIFT - 2), //current probe estimate is 1
-			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)) * 25, 1000), //q11 = 0.025
-			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)) * 25, 1000), //q22 = 0.025
+			kalman_q_core_param,
+			kalman_q_core_param,
 			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)), 10),  //r11 = 0.1
 			div_s64((((s64)1) << (NTP_SCALE_SHIFT - 2)), 10)); //r22 = 0.1
 		kalman_is_inited = 1;
+#ifdef CONFIG_PPS_DEBUG
+		printk(KERN_DEBUG "Kalman filter is inited\n");
+#endif
 	} else {
 		PPSKalman_Step(&kalman_filter, NSEC_PER_SEC,
 			NSEC_PER_SEC, timespec64_to_ns(raw_ts),
@@ -1257,7 +1326,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		pps_stabil, pps_calcnt);
 	printk(KERN_ALERT "pps_jitcnt: %ld, pps_stbcnt: %ld, pps_errcnt: %ld\n", pps_jitcnt, pps_stbcnt, pps_errcnt);
 #endif
-	pr_warning("%s: correction = %ld\n", __func_name, pps_phase_filter_smart(&jitter));
+	pr_warning("%s: correction = %ld\n", __func_name, phase_filer_res);
 	/* clear log entry for new log record creating */
 	clear_log_entry(&cur_entry);
 
