@@ -24,6 +24,8 @@
 #include <linux/string.h>
 #include <linux/init.h>
 
+#include <linux/fs.h>
+
 #include "ntp_internal.h"
 
 /*
@@ -125,9 +127,19 @@ static long pps_errcnt;		/* calibration errors */
 
 PPSKalman kalman_filter;
 char kalman_is_inited = 0;
+char kalman_force_stop = 1;
 s64 kalman_q_core_param = 0;
 s64 kalman_start_offset_core_param = 0;
 long (*pps_phase_filter_ptr)(long *) = NULL;
+
+void PPSKalman_stop(void);
+void PPSKalman_start(void);
+void PPSKalman_restart(void);
+
+#define KalmanProcName "kalmanctl"
+struct proc_dir_entry *kalman_proc = NULL;
+int kalman_open_cnt = 0;
+#define KalmanBufferSize 256
 
 #ifdef CONFIG_PPS_DEBUG
 //previous timestamps from __hardpps
@@ -203,8 +215,15 @@ static int __init setup_kernel_param_kalman_start(char *str) {
 	return 0;
 }
 
+static int __init setup_kernel_param_kalman_force_stop(char *str) {
+	printk(KERN_ALERT "Kernel param for Kalman: %s\n", str);
+	kalman_force_stop = simple_strtoll(str, NULL, 0);
+	return 0;
+}
+
 early_param("kalman_q", setup_kernel_param_kalman_q);
 early_param("kalman_start_offset", setup_kernel_param_kalman_start);
+early_param("kalman_force_stop", setup_kernel_param_kalman_force_stop);
 
 /* Sets values within profiler_vars_shot object from global variables */
 void get_vars_to_dump(profiler_vars_shot *dump);
@@ -1264,7 +1283,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	printk(KERN_DEBUG "phase_filer_res: %ld\n", phase_filer_res);
 #endif
 
-	if (!kalman_is_inited && ((kalman_start_offset_core_param <= 0) ||
+	if (!kalman_force_stop && !kalman_is_inited && ((kalman_start_offset_core_param <= 0) ||
 		(kalman_start_offset_core_param >= abs(phase_filer_res)))) {
 		PPSKalman_init(&kalman_filter, timespec64_to_ns(raw_ts), timespec64_to_ns(phase_ts),
 			((s64)1) << (NTP_SCALE_SHIFT - 2), ((s64)1) << (NTP_SCALE_SHIFT - 2), //current probe estimate is 1
@@ -1276,7 +1295,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 #ifdef CONFIG_PPS_DEBUG
 		printk(KERN_DEBUG "Kalman filter is inited\n");
 #endif
-	} else {
+	} else if (!kalman_force_stop) {
 		PPSKalman_Step(&kalman_filter, NSEC_PER_SEC,
 			NSEC_PER_SEC, timespec64_to_ns(raw_ts),
 			timespec64_to_ns(phase_ts));
@@ -1537,6 +1556,51 @@ static struct file_operations pps_proc_ops = {
 EXPORT_SYMBOL(set_vars_from_dump);
 #endif
 
+static int kalman_open(struct inode *nodep, struct file *filep) {
+	kalman_open_cnt++;
+	printk(KERN_DEBUG "Kalman ctl was opened\n");
+	return 0;
+}
+
+static int kalman_release(struct inode *nodep, struct file *filep) {
+	--kalman_open_cnt;
+	printk(KERN_DEBUG "Kalman ctl was released\n");
+	return 0;
+}
+
+static ssize_t kalman_write(struct file *filep,
+	const char *buf, size_t len, loff_t *offset)
+{
+	char buffer[KalmanBufferSize];
+	memset(buffer, 0, sizeof(buffer));
+	if (KalmanBufferSize < len) {
+		printk(KERN_ALERT "Attempt to write in kalman too big data\n");
+		return 0;
+	}
+	if (copy_from_user(buffer, buf, len)) {
+		printk(KERN_ALERT "Error while copying from user in kalman_write\n");
+		return -EFAULT;
+	}
+	*offset += len;
+	if (!strncmp(buffer, "stop", 4)) {
+		PPSKalman_stop();
+	} else if (!strncmp(buffer, "start", 5)) {
+		PPSKalman_start();
+	} else if (!strncmp(buffer, "restart", 7)) {
+		PPSKalman_restart();
+	} else {
+		printk(KERN_ALERT "Unknown command for kalman ctl: %s\n", buffer);
+	}
+	return len;
+}
+
+static struct file_operations kalman_proc_ops = {
+	.owner = THIS_MODULE,
+	.open = kalman_open,
+	.write = kalman_write,
+	.release = kalman_release
+};
+
 void __init ntp_init(void)
 {
 #ifdef CONFIG_PPS_PROFILER
@@ -1548,6 +1612,9 @@ void __init ntp_init(void)
 #endif
 
 	ntp_clear();
+
+	kalman_proc = proc_create(KalmanProcName, 0666, NULL, &kalman_proc_ops);
+	printk(KERN_ALERT "Kalman filter proc file was created\n");
 }
 
 // Kalman filter implementation
@@ -1601,4 +1668,21 @@ void PPSKalman_Step(PPSKalman *ob, s64 cv11, s64 cv21, s64 m11, s64 m21)
 
 	ob->cpe11 = kalman_step_update_cpe_impl(ob->r11, ob->cpe11, ob->q11);
 	ob->cpe22 = kalman_step_update_cpe_impl(ob->r22, ob->cpe22, ob->q22);
+}
+
+void PPSKalman_stop() {
+	kalman_force_stop = 1;
+	kalman_is_inited = 0;
+	printk(KERN_ALERT "Kalman is stopped\n");
+}
+
+void PPSKalman_start() {
+	kalman_force_stop = 0;
+	printk(KERN_ALERT "Kalman is started\n");
+}
+
+void PPSKalman_restart() {
+	kalman_is_inited = 0;
+	kalman_force_stop = 0;
+	printk(KERN_ALERT "Kalman is restarted\n");
 }
