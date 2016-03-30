@@ -1047,11 +1047,52 @@ static inline long pps_phase_filter_smart(long *jitter)
 	return res;
 }
 
+static inline long pps_phase_filter_average(long *jitter)
+{
+	long res;
+	int i;
+	unsigned prev = (pps_tf_pos + PPS_FILTER_SIZE - 1) % PPS_FILTER_SIZE;
+	*jitter = abs(pps_tf[pps_tf_pos] - pps_tf[prev]);
+	res = 0;
+	for (i = 0; i < PPS_FILTER_SIZE; ++i) {
+		res += pps_tf[i];
+	}
+	return res / PPS_FILTER_SIZE;
+}
+
+static inline long pps_phase_filter_median(long *jitter)
+{
+	static long sorted[PPS_FILTER_SIZE];
+	int i, j;
+	long tmp;
+	unsigned prev = (pps_tf_pos + PPS_FILTER_SIZE - 1) % PPS_FILTER_SIZE;
+	*jitter = abs(pps_tf[pps_tf_pos] - pps_tf[prev]);
+	memcpy(sorted, pps_tf, PPS_FILTER_SIZE * sizeof(long));
+	for (i = 0; i < PPS_FILTER_SIZE; ++i) {
+		for (j = 0; j < PPS_FILTER_SIZE - 1 - i; ++j) {
+			if (sorted[j] > sorted[j + 1]) {
+				tmp = sorted[j];
+				sorted[j] = sorted[j + 1];
+				sorted[j + 1] = tmp;
+			}
+		}
+	}
+	return sorted[PPS_FILTER_SIZE / 2];
+}
+
 static int __init setup_kernel_param_kalman_filter_algo(char *str) {
 	if (!strcmp(str, "smart")) {
+		printk(KERN_ALERT "Kalman smart choosen\n");
 		pps_phase_filter_ptr = pps_phase_filter_smart;
 	} else if (!strcmp(str, "last")) {
+		printk(KERN_ALERT "Kalman last choosen\n");
 		pps_phase_filter_ptr = pps_phase_filter_get;
+	} else if (!strcmp(str, "median")) {
+		printk(KERN_ALERT "Kalman median choosen\n");
+		pps_phase_filter_ptr = pps_phase_filter_median;
+	} else if (!strcmp(str, "average")) {
+		printk(KERN_ALERT "Kalman average choosen\n");
+		pps_phase_filter_ptr = pps_phase_filter_average;
 	}
 	return 0;
 }
