@@ -1057,6 +1057,8 @@ static inline long pps_phase_filter_average(long *jitter)
 	for (i = 0; i < PPS_FILTER_SIZE; ++i) {
 		res += pps_tf[i];
 	}
+	res = abs(res);
+	res = pps_tf[prev] > 0 ? res : -res;
 	return res / PPS_FILTER_SIZE;
 }
 
@@ -1064,7 +1066,7 @@ static inline long pps_phase_filter_median(long *jitter)
 {
 	static long sorted[PPS_FILTER_SIZE];
 	int i, j;
-	long tmp;
+	long tmp, res;
 	unsigned prev = (pps_tf_pos + PPS_FILTER_SIZE - 1) % PPS_FILTER_SIZE;
 	*jitter = abs(pps_tf[pps_tf_pos] - pps_tf[prev]);
 	memcpy(sorted, pps_tf, PPS_FILTER_SIZE * sizeof(long));
@@ -1077,7 +1079,9 @@ static inline long pps_phase_filter_median(long *jitter)
 			}
 		}
 	}
-	return sorted[PPS_FILTER_SIZE / 2];
+	res = abs(sorted[PPS_FILTER_SIZE / 2]);
+	res = pps_tf[prev] > 0 ? res : -res; 	
+	return res;
 }
 
 static int __init setup_kernel_param_kalman_filter_algo(char *str) {
