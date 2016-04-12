@@ -136,15 +136,23 @@ void PPSKalman_stop(void);
 void PPSKalman_start(void);
 void PPSKalman_restart(void);
 
+char freq_unstable_mask = 0;
+long freq_unstable_distance = 0;
+int inversions_percent = 0;
+long freq_ring[PPS_FILTER_SIZE];
+int freq_ring_pos = PPS_FILTER_SIZE - 1;
+char freq_is_unstable = 0;
+long freq_invers_admis_error = 500;
+#define FREQ_UNSTABLE_INVERSIONS 1
+#define FREQ_UNSTABLE_LAST_RING 2
+
 #define KalmanProcName "kalmanctl"
 struct proc_dir_entry *kalman_proc = NULL;
 int kalman_open_cnt = 0;
 #define KalmanBufferSize 256
 
-#ifdef CONFIG_PPS_DEBUG
 //previous timestamps from __hardpps
 struct timespec64 phase_ts_prev, raw_ts_prev;
-#endif
 
 #ifdef CONFIG_PPS_PROFILER
 
@@ -221,9 +229,32 @@ static int __init setup_kernel_param_kalman_force_stop(char *str) {
 	return 0;
 }
 
+static int __init setup_kernel_param_freq_inversions(char *str) {
+	printk(KERN_ALERT "Kernel param freq inversions: %s\n", str);
+	inversions_percent = simple_strtoll(str, NULL, 0);
+	freq_unstable_mask |= FREQ_UNSTABLE_INVERSIONS;
+	return 0;
+}
+
+static int __init setup_kernel_param_freq_ring_dist(char *str) {
+	printk(KERN_ALERT "Kernel param freq ring\n");
+	freq_unstable_distance = simple_strtoll(str, NULL, 0);
+	freq_unstable_mask |= FREQ_UNSTABLE_LAST_RING;
+	return 0;
+}
+
+static int __init setup_kernel_param_freq_admis_error(char *str) {
+	printk(KERN_ALERT "Kernel param freq admis error: %s\n", str);
+	freq_invers_admis_error = simple_strtoll(str, NULL, 0);
+	return 0;
+}
+
 early_param("kalman_q", setup_kernel_param_kalman_q);
 early_param("kalman_start_offset", setup_kernel_param_kalman_start);
 early_param("kalman_force_stop", setup_kernel_param_kalman_force_stop);
+early_param("pps_freq_inversions", setup_kernel_param_freq_inversions);
+early_param("pps_freq_ring_dist", setup_kernel_param_freq_ring_dist);
+early_param("pps_freq_invers_admis_error", setup_kernel_param_freq_admis_error);
 
 /* Sets values within profiler_vars_shot object from global variables */
 void get_vars_to_dump(profiler_vars_shot *dump);
@@ -1032,6 +1063,12 @@ static inline void pps_phase_filter_add(long err)
 	pps_tf[pps_tf_pos] = err;
 }
 
+static inline void pps_freq_ring_add(long freq)
+{
+	freq_ring_pos = (freq_ring_pos + 1)%PPS_FILTER_SIZE;
+	freq_ring[freq_ring_pos] = freq;
+}
+
 /* get smart value from the phase filter */
 static inline long pps_phase_filter_smart(long *jitter)
 {
@@ -1150,6 +1187,7 @@ static long hardpps_update_freq(struct pps_normtime freq_norm)
 
 	/* check if the frequency interval was too long */
 	if (freq_norm.sec > (2 << pps_shift)) {
+		printk(KERN_DEBUG "hardpps_update_freq: frequency interval was too long\n");
 		time_status |= STA_PPSERROR;
 		pps_errcnt++;
 		pps_dec_freq_interval();
@@ -1158,6 +1196,7 @@ static long hardpps_update_freq(struct pps_normtime freq_norm)
 			freq_norm.sec);
 		return 0;
 	}
+	printk(KERN_DEBUG "hardpps_update_freq: frequency interval is normal\n");
 
 	/* here the raw frequency offset and wander (stability) is
 	 * calculated. If the wander is less than the wander threshold
@@ -1167,13 +1206,17 @@ static long hardpps_update_freq(struct pps_normtime freq_norm)
 			freq_norm.sec);
 	delta = shift_right(ftemp - pps_freq, NTP_SCALE_SHIFT);
 	pps_freq = ftemp;
+	printk(KERN_DEBUG "hardpps_update_freq: delta: %ld, freq_norm.nsec = %ld, freq_norm.sec = %lld\n",
+		delta, freq_norm.nsec, freq_norm.sec);
 	if (abs(delta) > PPS_MAXWANDER) {
 		printk_deferred(KERN_WARNING
 				"hardpps: PPSWANDER: change=%ld\n", delta);
 		time_status |= STA_PPSWANDER;
 		pps_stbcnt++;
 		pps_dec_freq_interval();
-	} else {	/* good sample */
+		printk(KERN_DEBUG "hardpps_update_freq: bad sample\n");
+	} else if (!freq_is_unstable) {	/* good sample */
+		printk(KERN_DEBUG "hardpps_update_freq: good sample\n");
 		pps_inc_freq_interval();
 	}
 
@@ -1193,6 +1236,63 @@ static long hardpps_update_freq(struct pps_normtime freq_norm)
 	}
 
 	return delta;
+}
+
+static int get_inversions_cnt(int *all) {
+	int i, j;
+	int res;
+	if (all) *all = 0;
+	for (i = (pps_tf_pos + 1)%PPS_FILTER_SIZE,
+		res = 0; i != pps_tf_pos; i = (i + 1)%PPS_FILTER_SIZE)
+	{
+		for (j = (i + 1)%PPS_FILTER_SIZE; j != pps_tf_pos;
+			j = (j + 1)%PPS_FILTER_SIZE)
+		{
+			if (abs(pps_tf[i]) >= abs(pps_tf[j])
+				+ freq_invers_admis_error) ++res;
+			if (all) *all += 1;
+		}
+		if (abs(pps_tf[i]) >= abs(pps_tf[pps_tf_pos])
+			+ freq_invers_admis_error) ++res;
+		if (all) *all += 1;
+	}
+	return res;
+}
+
+static long get_distance_to_freqs(long freq) {
+	int i;
+	long tmp;
+	long res = abs(freq_ring[0] - freq);
+	for (i = 1; i < PPS_FILTER_SIZE; ++i) {
+		tmp = abs(freq_ring[i] - freq);
+		if (tmp < res) res = tmp;
+	}
+	return res;
+}
+
+/* Return true if frequency is unstable */
+static char check_freq_unstable(void) {
+	int all_inv;
+	int inv;
+	if (freq_unstable_mask & FREQ_UNSTABLE_INVERSIONS) {
+		inv = get_inversions_cnt(&all_inv);
+		if (inv * 100 < inversions_percent * all_inv) {
+			/* Too small inversions count - phase error is increasing */
+			freq_is_unstable = 1;
+			return 1;
+		}
+	}
+	if (freq_unstable_mask & FREQ_UNSTABLE_LAST_RING) {
+		if (get_distance_to_freqs(pps_freq >> NTP_SCALE_SHIFT) >
+			freq_unstable_distance)
+		{
+			/* Too big distance to frequency ring - too big change of freq */
+			freq_is_unstable = 1;
+			return 1;
+		}
+	}
+	freq_is_unstable = 0;
+	return 0;
 }
 
 /* correct REALTIME clock phase error against PPS signal */
@@ -1321,7 +1421,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	struct pps_normtime pts_norm, freq_norm;
 	long jitter;
 	struct timespec64 raw_time = *raw_ts;
-	struct timespec64 real_time = *phase_ts;
+	struct timespec64 real_time = *phase_ts, buf_timespec1, buf_timespec2;
 	int j, t;
 	long phase_filer_res = pps_phase_filter_impl(&jitter);
 #ifdef CONFIG_PPS_DEBUG
@@ -1356,9 +1456,15 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		real_time = ns_to_timespec64(kalman_filter.cse21);
 	}
 #ifdef CONFIG_PPS_DEBUG
+	buf_timespec1 = timespec64_sub(*phase_ts, phase_ts_prev);
+	buf_timespec2 = timespec64_sub(*raw_ts, raw_ts_prev);
+#endif
+	if (raw_ts_prev.tv_nsec) {
+		pps_freq_ring_add(NSEC_PER_SEC - timespec64_to_ns(&buf_timespec2));
+		printk(KERN_ALERT "Add to freq ring: %ld\n", freq_ring[freq_ring_pos]);
+	}
 	phase_ts_prev = *phase_ts;
 	raw_ts_prev = *raw_ts;
-#endif
 
 #ifdef CONFIG_PPS_PROFILER
 	spin_lock(&profiler_ring_lock);
@@ -1373,6 +1479,8 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	}
 #ifdef PPS_PROFILER_DEBUG
 	printk(KERN_ALERT "phase_ts: %llu, raw_ts: %llu\n", timespec64_to_ns(phase_ts), timespec64_to_ns(raw_ts));
+	printk(KERN_ALERT "phase_ts-diff: %lld, raw_ts-diff: %lld, raw-diff - 1s: %lld\n", timespec64_to_ns(&buf_timespec1),
+		timespec64_to_ns(&buf_timespec2), NSEC_PER_SEC - timespec64_to_ns(&buf_timespec2));
 	printk(KERN_ALERT "tick_usec: %lu, tick_nsec: %lu, tick_length: %llu, tick_length_base: %llu\n", tick_usec, tick_nsec,
 		tick_length, tick_length_base);
 	printk(KERN_ALERT "time_state: %d, time_status: %d, time_offset: %lld, time_constant: %ld\n", time_state, time_status,
@@ -1415,6 +1523,7 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		push_entry_to_ring(&cur_entry);
 		spin_unlock(&profiler_ring_lock);
 #endif
+		memset(freq_ring, 0, sizeof(long) * PPS_FILTER_SIZE);
 		return;
 	}
 
@@ -1422,10 +1531,12 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 	freq_norm = pps_normalize_ts(timespec64_sub(raw_time, pps_fbase));
 #ifdef PPS_DEBUG
 	pr_warning("pts_norm={%ld,%ld} raw_time.nsec=%ld freq_norm={%ld,%ld}\n", pts_norm.sec, pts_norm.nsec, raw_time.tv_nsec, freq_norm.sec, freq_norm.nsec);
+	printk(KERN_DEBUG "pts_norm={%ld,%ld} raw_time.nsec=%ld freq_norm={%ld,%ld}\n", pts_norm.sec, pts_norm.nsec, raw_time.tv_nsec, freq_norm.sec, freq_norm.nsec);
 #endif
 	/* check that the signal is in the range
 	 * [1s - MAXFREQ us, 1s + MAXFREQ us], otherwise reject it */
 	if (abs(freq_norm.nsec) > MAXFREQ * freq_norm.sec) {
+		printk(KERN_DEBUG "Freq signal is not in range, reject\n");
 		time_status |= STA_PPSJITTER;
 		/* restart the frequency calibration interval */
 		pps_fbase = raw_time;
@@ -1437,11 +1548,22 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 #endif
 		return;
 	}
+	printk(KERN_DEBUG "frequency signal is ok");
 
 	/* signal is ok */
 
+	/* check if frequency signal is unstable */
+	if (check_freq_unstable()) {
+		/* apply current interval, decrease length and start new */
+		printk(KERN_ALERT "frequency is unstable\n");
+		pps_fbase = raw_time;
+		pps_calcnt++;
+		hardpps_update_freq(freq_norm);
+		pps_dec_freq_interval();
+	} else
 	/* check if the current frequency interval is finished */
 	if (freq_norm.sec >= (1 << pps_shift)) {
+		printk(KERN_DEBUG "frequency interval is finished\n");
 		pps_calcnt++;
 		/* restart the frequency calibration interval */
 		pps_fbase = raw_time;
@@ -1660,6 +1782,8 @@ void __init ntp_init(void)
 
 	kalman_proc = proc_create(KalmanProcName, 0666, NULL, &kalman_proc_ops);
 	printk(KERN_ALERT "Kalman filter proc file was created\n");
+	memset(&raw_ts_prev, 0, sizeof(struct timespec64));
+	phase_ts_prev = raw_ts_prev;
 }
 
 // Kalman filter implementation
