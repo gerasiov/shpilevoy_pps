@@ -1249,13 +1249,14 @@ static int get_inversions_cnt(int *all) {
 			j = (j + 1)%PPS_FILTER_SIZE)
 		{
 			if (abs(pps_tf[i]) >= abs(pps_tf[j])
-				+ freq_invers_admis_error) ++res;
+				- freq_invers_admis_error) ++res;
 			if (all) *all += 1;
 		}
 		if (abs(pps_tf[i]) >= abs(pps_tf[pps_tf_pos])
-			+ freq_invers_admis_error) ++res;
+			- freq_invers_admis_error) ++res;
 		if (all) *all += 1;
 	}
+	printk(KERN_ALERT "Inversions cnt: %d\n", res);
 	return res;
 }
 
@@ -1267,6 +1268,7 @@ static long get_distance_to_freqs(long freq) {
 		tmp = abs(freq_ring[i] - freq);
 		if (tmp < res) res = tmp;
 	}
+	printk(KERN_ALERT "get_distance_to_freqs: need=%ld, get=%ld", freq, res);
 	return res;
 }
 
@@ -1498,6 +1500,10 @@ void __hardpps(const struct timespec64 *phase_ts, const struct timespec64 *raw_t
 		pps_stabil, pps_calcnt);
 	printk(KERN_ALERT "pps_jitcnt: %ld, pps_stbcnt: %ld, pps_errcnt: %ld\n", pps_jitcnt, pps_stbcnt, pps_errcnt);
 #endif
+	printk(KERN_ALERT "freq_pos: %d, freq_ring: \n", freq_ring_pos);
+	for (j = 0; j < PPS_FILTER_SIZE; ++j) {
+		printk(KERN_ALERT "[%d]: %ld, ", j, freq_ring[j]);
+	}
 	pr_warning("%s: correction = %ld\n", __func_name, phase_filer_res);
 	/* clear log entry for new log record creating */
 	clear_log_entry(&cur_entry);
